@@ -1,0 +1,59 @@
+@baseUrl = http://localhost:8000
+
+### Health Check Endpoint
+GET {{baseUrl}}/health
+
+### User Registration Endpoint
+POST {{baseUrl}}/users
+Content-Type: application/json
+
+{
+    "name": "John Other Doe",
+    "email": "john.doe3@example.com",
+    "password": "12345678"
+}
+
+
+### User Token Creation Endpoint
+# @name login
+POST {{baseUrl}}/users/token
+Content-Type: application/x-www-form-urlencoded
+
+username=john.doe3@example.com&password=12345678
+
+###
+@token = {{login.response.body.access_token}}
+
+### Get User Profile Endpoint
+GET {{baseUrl}}/users/profile
+Authorization: Bearer {{token}}
+
+### Select a plan for the user (protected endpoint)
+POST {{baseUrl}}/subscriptions/select-plan
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "plan_id": 3,
+    "credit_card": "1234 5678 9012 3456"
+}
+
+
+### Get user plans (protected endpoint)
+GET {{baseUrl}}/subscriptions/user
+Authorization: Bearer {{token}}
+
+
+### Create a bank account (protected endpoint)
+POST {{baseUrl}}/movements/bank-accounts
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "name": "Conta Teste 56",
+    "bank_name": "Banco Roxinho",
+    "account_number": "12345678",
+    "account_type": "Corrente",
+    "initial_balance": 1000.00
+}
+
