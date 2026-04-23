@@ -1754,14 +1754,14 @@ class UserPlan(Base):
     __table_args__ = {"schema": "subscription"}
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey(User.id), nullable=False)
+    user_id = Column(Integer, ForeignKey("subscription.users.id"), nullable=False)
     plan_id = Column(Integer, ForeignKey(Plan.id), nullable=False)
     active = Column(Boolean, nullable=False, default=False)
     credit_card = Column(String(24), nullable=True)  # simplificado para estudo
     created_at = Column(DateTime, nullable=False)
 
-    user = relationship(User, back_populates="user_plans")
-    plan = relationship(Plan, back_populates="user_plans")
+    user = relationship("app.subscription.user._user.User", back_populates="user_plans")
+    plan = relationship(Plan)
 ```
 
 | Campo | Decisão |
@@ -1771,19 +1771,22 @@ class UserPlan(Base):
 | `created_at` | Quando o usuário assinou |
 | `relationship` | SQLAlchemy ORM — permite `user_plan.user` e `user_plan.plan` em vez de fazer JOIN manual |
 
-**`back_populates`** requer que `User` e `Plan` também declarem `user_plans = relationship(UserPlan, ...)` — caso contrário SQLAlchemy lança erro de configuração na inicialização.
+**Por que string no `relationship("app.subscription.user._user.User")`?**
 
-**`__init__` com invariantes:**
+O SQLAlchemy aceita o caminho completo do módulo como string para evitar importação circular — `_user_plan.py` importa `_user.py` (para a FK), e `_user.py` importa `_user_plan.py` indiretamente via relationship. Usar a string adia a resolução para depois de todos os mappers estarem carregados.
+
+**`plan = relationship(Plan)` sem `back_populates`** — `UserPlan` acessa `user_plan.plan`, mas `Plan` não precisa navegar de volta para `UserPlan` neste modelo. O `back_populates` é opcional quando a navegação é unidirecional.
+
+**`__init__` sem validação de IDs — o Aggregate Root é o guardião:**
 ```python
-def __init__(self, user_id: int, plan_id: int, active: bool, credit_card: str | None, ...):
-    DomainException.validate(user_id > 0, "User ID must be greater than 0")
-    DomainException.validate(plan_id > 0, "Plan ID must be greater than 0")
+def __init__(self, plan: Plan, active: bool, credit_card: str | None):
+    self.plan = plan      # SQLAlchemy preenche plan_id via relationship
     self.active = active
     self.credit_card = credit_card
-    self.created_at = datetime.now(timezone.utc)  # timestamp automático, ignora parâmetro
+    self.created_at = datetime.now(timezone.utc)
 ```
 
-IDs negativos ou zero não fazem sentido como referências — validados na criação. `created_at` é sempre gerado internamente, mesmo que o parâmetro esteja na assinatura.
+`UserPlan` não valida `user_id` ou `plan_id` diretamente — esses valores são preenchidos pelo SQLAlchemy via relationship quando `user.user_plans.append(user_plan)` é chamado. A validação de negócio fica no Aggregate Root `User.add_plan()`, não aqui. `created_at` é sempre gerado internamente — timestamp automático no momento da assinatura.
 
 ---
 
@@ -1829,22 +1832,19 @@ class UserRepository:
     def get_by_email(self, email: str) -> User | None:
         return self.db.query(User).filter(User.email == email).first()
 
-    def save(self, user: User):
-        self.db.add(user)   # add() faz upsert — insere se novo, atualiza se existente
-        self.db.commit()
-        self.db.refresh(user)
-
 def get_user_repository(db: Session = Depends(get_db)) -> UserRepository:
     return UserRepository(db)
 ```
 
-O fluxo para assinar um plano será:
+**`create()` serve tanto para inserir quanto para atualizar.** Quando `user` já existe na sessão (carregado por `get_by_email`), o `db.add()` é um no-op — o SQLAlchemy já está rastreando o objeto. O `db.commit()` persiste todas as mudanças acumuladas na sessão: tanto as modificações nas entidades existentes (`active=False` nos UserPlans antigos) quanto a inserção do novo `UserPlan` adicionado ao `user.user_plans`.
+
+O fluxo para assinar um plano:
 ```
-caso de uso (subscribe)
+caso de uso (select_plan)
   → user_repository.get_by_email(email)   # busca o Aggregate Root
   → plan_repository.get_by_id(plan_id)    # busca o plano
   → user.add_plan(plan, credit_card)      # regra de negócio no AR
-  → user_repository.save(user)            # persiste o agregado inteiro
+  → user_repository.create(user)          # persiste o agregado inteiro
 ```
 
 O repositório opera sempre no Aggregate Root (`User`) — nunca em `UserPlan` diretamente. Salvar o `User` propaga as mudanças em `user_plans` via SQLAlchemy (cascade).
@@ -1867,42 +1867,45 @@ app/subscription/user/
 ```python
 class SelectPlanCreate(BaseModel):
     plan_id: int
-    credit_card: str
+    credit_card: str | None = None
 
 async def select_plan(
     body: SelectPlanCreate,
     email: str = Depends(get_email_from_token),
     user_repository: UserRepository = Depends(get_user_repository),
     plan_repository: PlanRepository = Depends(get_plan_repository),
+    query_user_by_email: QueryUserByEmail = Depends(get_query_user_by_email),
 ) -> None:
     user = user_repository.get_by_email(email)
     if not user:
-        user = User(name="Default", email=email)
+        user_auth = query_user_by_email.execute(email)
+        user = User(name=user_auth.name, email=email)
 
     plan = plan_repository.get_by_id(body.plan_id)
     user.add_plan(plan, body.credit_card)
-    user_repository.save(user)
+    user_repository.create(user)
 ```
 
 **Fluxo do caso de uso:**
 
 ```
-POST /subscription/plan
+POST /subscriptions/select-plan
   → extrai email do JWT (get_email_from_token)
-  → busca User pelo email (ou cria novo)
+  → busca User em subscription.users (ou cria via QueryUserByEmail)
   → busca Plan pelo id
-  → user.add_plan(plan, credit_card)  ← regra de negócio no AR
-  → user_repository.save(user)        ← persiste o agregado
+  → user.add_plan(plan, credit_card)   ← regra de negócio no AR
+  → user_repository.create(user)       ← persiste o agregado
 ```
 
 **Decisões de design:**
 
 | Elemento | Decisão |
 |---|---|
-| `email = Depends(get_email_from_token)` | Identidade vem do JWT — `subscription` não consulta `authentication` |
-| `if not user: User(name="Default", email=email)` | Cria usuário no `subscription` se ainda não existe — os dados de auth e subscription são independentes |
+| `email = Depends(get_email_from_token)` | Identidade vem do JWT — `subscription` não consulta `authentication` diretamente |
+| `credit_card: str \| None = None` | Opcional no schema — a validação real fica em `User.add_plan()`: obrigatório só para planos pagos |
+| `if not user: query_user_by_email.execute(email)` | Cria usuário no `subscription` com o nome real de `authentication` via Query Object — sem importar entidades externas |
 | `user.add_plan(...)` | A regra de negócio fica no Aggregate Root — o caso de uso só orquestra |
-| `user_repository.save(user)` | Salva o AR inteiro — SQLAlchemy propaga as mudanças em `user_plans` via cascade |
+| `user_repository.create(user)` | Funciona como upsert: insere se novo, propaga mudanças via cascade se existente |
 
 ---
 
@@ -2124,120 +2127,6 @@ if not user:
 ```
 
 Antes criava `User(name="Default", email=email)` — agora o nome vem do bounded context `authentication` via DTO, sem importar nenhuma entidade interna. Esse é o padrão Query Object em ação: `subscription` obtém dados de `authentication` sem acoplamento direto.
-
----
-
----
-
-## Passo 32 — Novo bounded context: `movement`
-
-```
-app/movement/
-├── __init__.py              ← exporta movement_router
-├── route.py
-└── bank/
-    ├── _bank_account.py     ← entidade + Value Object User
-    ├── _bank_account_repository.py
-    └── _register_bank_account.py
-```
-
-### Value Object `User` com SQLAlchemy `composite`
-
-**`_bank_account.py`:**
-```python
-class AccountStatus(Enum):
-    ACTIVE = "active"
-    INACTIVE = "inactive"
-    CLOSED = "closed"
-    SUSPENDED = "suspended"
-
-class User:
-    def __init__(self, name: str, email: str):
-        self.name = name
-        self.email = email
-        DomainException.validate(name and len(name) <= 128, "...")
-        DomainException.validate(email and "@" in email, "...")
-
-    def __composite_values__(self):
-        return self.name, self.email   # obrigatório para SQLAlchemy composite
-
-class BankAccount(Base):
-    __tablename__ = "bank_accounts"
-    __table_args__ = {"schema": "movement"}
-
-    id = Column(Integer, primary_key=True)
-    name = Column(String(24), nullable=False)
-    bank_name = Column(String(24), nullable=False)
-    account_number = Column(String(24), nullable=False)
-    balance = Column(Numeric(precision=15), nullable=False, default=0)
-    status = Column(String(20), nullable=False, default=AccountStatus.ACTIVE.value)
-    _user_name = Column("user_name", String(128), nullable=False)
-    _user_email = Column("user_email", String(128), nullable=False)
-    user = composite(User, _user_name, _user_email)
-```
-
-**Por que `composite`?**
-
-`User` aqui é um **Value Object** — não tem identidade própria, representa dados do dono da conta embutidos diretamente em `BankAccount`. O `composite` do SQLAlchemy mapeia dois campos (`user_name`, `user_email`) para um único objeto Python (`User`):
-
-```python
-# No banco: duas colunas separadas
-user_name  | user_email
------------|--------------------
-João       | joao@email.com
-
-# No Python: um objeto
-bank_account.user.name   # "João"
-bank_account.user.email  # "joao@email.com"
-```
-
-`__composite_values__` é obrigatório — diz ao SQLAlchemy como desmembrar o objeto em colunas.
-
-| Conceito | Aqui |
-|---|---|
-| **Entidade** | `BankAccount` — tem identidade (`id`) |
-| **Value Object** | `User` — sem identidade, definido pelos seus valores |
-
-### Regra de negócio: limite de contas por plano
-
-**`_register_bank_account.py`:**
-```python
-async def register_bank_account(
-    body: BankAccountCreate,
-    email: str = Depends(get_email_from_token),
-    bank_account_repository: BankAccountRepository = Depends(get_bank_account_repository),
-    query_user_by_email: QueryUserByEmail = Depends(get_query_user_by_email),
-    query_user_plan: QueryUserPlan = Depends(get_query_user_plan),
-) -> None:
-    user_plan = query_user_plan.execute(email)
-    if not user_plan:
-        raise HTTPException(status_code=400, detail="User has no active plan")
-
-    bank_accounts = bank_account_repository.get_all_by_user(email)
-    if len(bank_accounts) >= user_plan.max_number_accounts:
-        raise HTTPException(status_code=400, detail="Maximum bank accounts reached")
-
-    user_auth = query_user_by_email.execute(email)
-    user = User(name=user_auth.name, email=user_auth.email)
-    bank_account = BankAccount(name=body.name, bank_name=body.bank_name,
-                               account_number=body.account_number, user=user,
-                               balance=body.initial_balance)
-    bank_account_repository.create(bank_account)
-```
-
-**Dois Query Objects cruzando bounded contexts:**
-
-| Query Object | Origem | O que retorna |
-|---|---|---|
-| `QueryUserByEmail` | `authentication` | Nome e email do usuário |
-| `QueryUserPlan` | `subscription` | Plano ativo e `max_number_accounts` |
-
-`movement` não importa nenhuma entidade de `authentication` ou `subscription` — usa apenas os DTOs dos Query Objects. Essa é a fronteira entre bounded contexts funcionando: dados primitivos via interfaces públicas.
-
-**Regra de negócio centralizada no caso de uso:**
-1. Verifica se o usuário tem plano ativo
-2. Verifica se atingiu o limite de contas do plano (`max_number_accounts`)
-3. Só então cria a conta bancária
 
 ---
 
